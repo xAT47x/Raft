@@ -145,13 +145,83 @@ type RequestVoteReply struct {
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (3A, 3B).
-	// TODO (Part 2): Implement RequestVote receiver rules (§5.1, §5.2, §5.4)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.VoteGranted = false
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	}
+	if args.Term > rf.currentTerm {
+		rf.becomeFollower(args.Term) // updates term, clears votedFor
+	}
+	reply.Term = rf.currentTerm
+
+	lastIdx, lastTerm := rf.lastLogIndexAndTerm()
+	upToDate := args.LastLogTerm > lastTerm ||
+		(args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIdx)
+
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && upToDate {
+		rf.votedFor = args.CandidateId
+		rf.resetElectionTimer() // only reset when the vote is actually granted
+		reply.VoteGranted = true
+	}
 }
 
 // Start a new election (must be called with rf.mu held)
 func (rf *Raft) startElection() {
-	// TODO (Part 2): Transition to Candidate, increment term, vote for self, reset timer, and send RequestVote RPCs to all peers
+	rf.state = Candidate
+	rf.currentTerm++
+	rf.votedFor = rf.me
+	rf.resetElectionTimer()
+
+	lastIdx, lastTerm := rf.lastLogIndexAndTerm()
+	args := &RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: lastIdx,
+		LastLogTerm:  lastTerm,
+	}
+	votes := 1 // own vote; only touched while holding rf.mu
+
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(server int) {
+			reply := &RequestVoteReply{}
+			if !rf.sendRequestVote(server, args, reply) {
+				return
+			}
+
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			// stale reply: no longer a candidate, or a newer election started
+			if rf.state != Candidate || rf.currentTerm != args.Term {
+				return
+			}
+			if reply.Term > rf.currentTerm {
+				rf.becomeFollower(reply.Term)
+				return
+			}
+			if reply.VoteGranted {
+				votes++
+				if votes > len(rf.peers)/2 {
+					rf.state = Leader
+					last, _ := rf.lastLogIndexAndTerm()
+					for p := range rf.peers {
+						rf.nextIndex[p] = last + 1
+						rf.matchIndex[p] = 0
+					}
+					rf.matchIndex[rf.me] = last
+					go rf.broadcastAppendEntries() // assert leadership immediately
+				}
+			}
+		}(i)
+	}
 }
 
 type AppendEntriesArgs struct {
@@ -173,8 +243,67 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	// Your code here (3A, 3B).
-	// TODO (Part 2 / Part 3): Implement AppendEntries receiver rules + ConflictTerm/ConflictIndex fast backup
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Success = false
+	reply.ConflictTerm = -1
+	reply.ConflictIndex = 0
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	// valid leader for this term: step down if needed and reset the timer
+	rf.becomeFollower(args.Term)
+	rf.resetElectionTimer()
+	reply.Term = rf.currentTerm
+
+	// log consistency check with fast-backup hints
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.ConflictIndex = len(rf.log)
+		return
+	}
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		ct := rf.log[args.PrevLogIndex].Term
+		ci := args.PrevLogIndex
+		for ci > 1 && rf.log[ci-1].Term == ct {
+			ci--
+		}
+		reply.ConflictTerm = ct
+		reply.ConflictIndex = ci
+		return
+	}
+
+	// append, truncating only on a real conflict (so delayed/duplicate RPCs
+	// can't chop off entries that already match)
+	for i, e := range args.Entries {
+		idx := args.PrevLogIndex + 1 + i
+		if idx < len(rf.log) {
+			if rf.log[idx].Term == e.Term {
+				continue
+			}
+			rf.log = rf.log[:idx]
+		}
+		rf.log = append(rf.log, args.Entries[i:]...)
+		break
+	}
+
+	// commit update, bounded by the last entry this RPC verified
+	if args.LeaderCommit > rf.commitIndex {
+		lastNew := args.PrevLogIndex + len(args.Entries)
+		newCommit := args.LeaderCommit
+		if lastNew < newCommit {
+			newCommit = lastNew
+		}
+		if newCommit > rf.commitIndex {
+			rf.commitIndex = newCommit
+			rf.applyCond.Signal()
+		}
+	}
+
+	reply.Success = true
 }
 
 // example code to send a RequestVote RPC to a server.
