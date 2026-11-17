@@ -96,29 +96,46 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (3A).
-	// TODO (Part 1): Lock rf.mu, read currentTerm and whether state == Leader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term = rf.currentTerm
+	isleader = rf.state == Leader
 	return term, isleader
 }
 
 // Helper: get last log index and term (must be called with rf.mu held)
 func (rf *Raft) lastLogIndexAndTerm() (int, int) {
-	// TODO (Part 1): Return last index in rf.log and its Term
-	return 0, 0
+	lastIdx := len(rf.log) - 1
+	return lastIdx, rf.log[lastIdx].Term
 }
 
 // Helper: reset randomized election timeout (must be called with rf.mu held)
 func (rf *Raft) resetElectionTimer() {
-	// TODO (Part 1): Update rf.lastElectionReset to time.Now() and set randomized rf.electionTimeout
+	rf.lastElectionReset = time.Now()
+	// Randomized between 250ms and 450ms
+	rf.electionTimeout = time.Duration(250+rand.Intn(200)) * time.Millisecond
 }
 
 // Helper: transition to Follower (must be called with rf.mu held)
 func (rf *Raft) becomeFollower(term int) {
-	// TODO (Part 1): Set state = Follower; if term > currentTerm, update currentTerm and reset votedFor = -1
+	rf.state = Follower
+	if term > rf.currentTerm {
+		rf.currentTerm = term
+		rf.votedFor = -1
+	}
 }
 
 // Election timer loop
 func (rf *Raft) electionTicker() {
-	// TODO (Part 1): Loop while !rf.killed(), check if electionTimeout elapsed for non-Leader, and call rf.startElection()
+	for !rf.killed() {
+		time.Sleep(15 * time.Millisecond)
+
+		rf.mu.Lock()
+		if rf.state != Leader && time.Since(rf.lastElectionReset) >= rf.electionTimeout {
+			rf.startElection()
+		}
+		rf.mu.Unlock()
+	}
 }
 
 // ============================================================================
