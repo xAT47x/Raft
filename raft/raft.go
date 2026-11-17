@@ -363,30 +363,198 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := false
 
-	// Your code here (3B).
-	// TODO (Part 3): If Leader, append entry to rf.log, update matchIndex/nextIndex, call broadcastAppendEntries(), and return immediately
+	rf.mu.Lock()
+	if rf.state != Leader {
+		rf.mu.Unlock()
+		return index, term, isLeader
+	}
+
+	term = rf.currentTerm
+	isLeader = true
+	rf.log = append(rf.log, LogEntry{
+		Command: command,
+		Term:    term,
+	})
+	index = len(rf.log) - 1
+	rf.matchIndex[rf.me] = index
+	rf.nextIndex[rf.me] = index + 1
+	rf.mu.Unlock()
+
+	// Trigger an immediate broadcast without waiting for the next heartbeat tick
+	rf.broadcastAppendEntries()
 
 	return index, term, isLeader
 }
 
 // Periodic Heartbeats
 func (rf *Raft) heartbeatTicker() {
-	// TODO (Part 3): Loop every ~100ms while !rf.killed(); if Leader, call rf.broadcastAppendEntries()
+	for !rf.killed() {
+		rf.mu.Lock()
+		isLeader := rf.state == Leader
+		rf.mu.Unlock()
+
+		if isLeader {
+			rf.broadcastAppendEntries()
+		}
+
+		// Loop every 100ms to stay within the <= 10 heartbeats/sec rule
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // Log Replication & Fast Backup
 func (rf *Raft) broadcastAppendEntries() {
-	// TODO (Part 3): Send AppendEntries RPCs in parallel to all peers, handle replies, update matchIndex/nextIndex, and fast backup on conflict
+	rf.mu.Lock()
+	if rf.state != Leader {
+		rf.mu.Unlock()
+		return
+	}
+	rf.mu.Unlock()
+
+	for i := range rf.peers {
+		if i != rf.me {
+			go rf.replicateToPeer(i)
+		}
+	}
 }
 
-// Advance commitIndex (must be called with rf.mu held)
+// Send AppendEntries to a single peer and handle the reply
+func (rf *Raft) replicateToPeer(peer int) {
+	rf.mu.Lock()
+	if rf.state != Leader {
+		rf.mu.Unlock()
+		return
+	}
+
+	nextIdx := rf.nextIndex[peer]
+	if nextIdx < 1 {
+		nextIdx = 1
+	}
+	prevLogIndex := nextIdx - 1
+	prevLogTerm := rf.log[prevLogIndex].Term
+	entries := append([]LogEntry{}, rf.log[nextIdx:]...)
+
+	args := &AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: rf.commitIndex,
+	}
+	rf.mu.Unlock()
+
+	reply := &AppendEntriesReply{}
+	if !rf.sendAppendEntries(peer, args, reply) {
+		return
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// Ignore delayed replies if we are no longer Leader or the term has changed
+	if rf.state != Leader || rf.currentTerm != args.Term {
+		return
+	}
+
+	// Step down if peer has a higher term
+	if reply.Term > rf.currentTerm {
+		rf.becomeFollower(reply.Term)
+		return
+	}
+
+	if reply.Success {
+		newMatchIndex := args.PrevLogIndex + len(args.Entries)
+		if newMatchIndex > rf.matchIndex[peer] {
+			rf.matchIndex[peer] = newMatchIndex
+		}
+		rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+		rf.updateCommitIndex()
+	} else {
+		rf.backupNextIndex(peer, reply)
+	}
+}
+
+// Fast backup of nextIndex on AppendEntries rejection
+func (rf *Raft) backupNextIndex(peer int, reply *AppendEntriesReply) {
+	if reply.ConflictTerm == -1 {
+		// Follower's log was shorter than PrevLogIndex
+		rf.nextIndex[peer] = reply.ConflictIndex
+	} else {
+		// search leader's log from back to front for reply.ConflictTerm
+		lastIndexWithTerm := -1
+		for idx := len(rf.log) - 1; idx >= 1; idx-- {
+			if rf.log[idx].Term == reply.ConflictTerm {
+				lastIndexWithTerm = idx
+				break
+			}
+		}
+		if lastIndexWithTerm != -1 {
+			rf.nextIndex[peer] = lastIndexWithTerm + 1
+		} else {
+			rf.nextIndex[peer] = reply.ConflictIndex
+		}
+	}
+
+	if rf.nextIndex[peer] < 1 {
+		rf.nextIndex[peer] = 1
+	}
+}
+
+// Advance commitIndex
 func (rf *Raft) updateCommitIndex() {
-	// TODO (Part 3): Find N > commitIndex replicated on a majority where log[N].Term == currentTerm, update commitIndex, and Signal applyCond
+	for n := len(rf.log) - 1; n > rf.commitIndex; n-- {
+		// Only commit entries from the leader's currentTerm by counting replicas
+		if rf.log[n].Term != rf.currentTerm {
+			continue
+		}
+
+		count := 0
+		for i := range rf.peers {
+			// if the server have bigger term it hase already committed the entry, so we can count it as well
+			if i == rf.me || rf.matchIndex[i] >= n {
+				count++
+			}
+		}
+
+		if count > len(rf.peers)/2 {
+			rf.commitIndex = n
+			rf.applyCond.Signal()
+			break
+		}
+	}
 }
 
 // State Machine Applier Goroutine
 func (rf *Raft) applier() {
-	// TODO (Part 3): Wait on applyCond until commitIndex > lastApplied, copy newly committed entries, unlock, and send ApplyMsg to applyCh
+	for !rf.killed() {
+		rf.mu.Lock()
+		// Wait until there are new committed entries to apply
+		for rf.commitIndex <= rf.lastApplied && !rf.killed() {
+			rf.applyCond.Wait()
+		}
+		if rf.killed() {
+			rf.mu.Unlock()
+			return
+		}
+
+		// Apply all committed but not yet applied entries
+		commitIndex := rf.commitIndex
+		lastApplied := rf.lastApplied
+		entries := make([]LogEntry, commitIndex-lastApplied)
+		copy(entries, rf.log[lastApplied+1:commitIndex+1])
+		rf.lastApplied = commitIndex
+		rf.mu.Unlock()
+
+		// Send ApplyMsg for each new entry to the service
+		for i, entry := range entries {
+			msg := ApplyMsg{
+				Index:   lastApplied + 1 + i,
+				Command: entry.Command,
+			}
+			rf.applyCh <- msg
+		}
+	}
 }
 
 // ============================================================================
